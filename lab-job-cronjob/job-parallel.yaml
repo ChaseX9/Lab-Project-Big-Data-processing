@@ -1,0 +1,26 @@
+﻿apiVersion: batch/v1
+kind: Job
+metadata:
+  name: batch-export-job
+  namespace: lab-job-cronjob
+spec:
+  parallelism: 4
+  completions: 4
+  completionMode: Indexed
+  backoffLimit: 2
+  ttlSecondsAfterFinished: 600
+  template:
+    spec:
+      containers:
+      - name: export
+        image: python:3.13-slim
+        command: ["python", "-c"]
+        args:
+          - |
+            import os, time
+            pod = os.getenv('HOSTNAME', 'unknown')
+            shard = int(os.environ['JOB_COMPLETION_INDEX'])
+            print(f"Pod {pod}: Exporting shard {shard} (users with id % 4 == {shard})...")
+            time.sleep(5)
+            print(f"Pod {pod}: Shard {shard} export completed!")
+      restartPolicy: Never
