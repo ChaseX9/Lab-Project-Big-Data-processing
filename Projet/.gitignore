@@ -1,0 +1,22 @@
+# Data (IMDb dumps, Parquet tables, reports) is never committed.
+data/
+*.parquet
+*.tsv
+*.tsv.gz
+*.csv
+
+# Local configuration
+.env
+
+# Python / Jupyter
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+.venv/
+venv/
+
+# Misc
+throttle.ctrl
+spark-warehouse/
+metastore_db/
+derby.log
