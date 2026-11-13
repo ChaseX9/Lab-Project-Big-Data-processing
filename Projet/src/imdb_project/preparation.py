@@ -3,14 +3,15 @@
 Rules applied (see ``data/reports/quality_issues`` for the counts):
 
 1. Types: every column is cast to its expected type (``schemas.TABLE_COLUMNS``);
-   0/1 flags become booleans.
-2. Lists: comma-separated columns become arrays; ``characters`` (a JSON
-   array in the source) is parsed into an array.
-3. Impossible values are set to null (e.g. a runtime of 0 minutes, birth and
-   death years when the death comes first).
-4. Suspicious but possible values are kept and listed in a ``dq_flags`` array
-   column (e.g. an actor who died before the release: archive footage,
-   posthumous release...).
+   0/1 flags become booleans (any other value becomes null and is flagged).
+2. Lists: comma-separated columns become arrays (empty items are removed);
+   ``characters`` (a JSON array in the source) is parsed into an array.
+3. Every row check of ``quality.py`` is also a flag of the silver row, in a
+   ``dq_flags`` array column. The checks classified ``impossible_value`` set
+   the columns involved to null (``IMPOSSIBLE_VALUE_COLUMNS``, e.g. a runtime
+   of 0 minutes, birth and death years when the death comes first).
+4. Suspicious but possible values are kept and only flagged (e.g. an actor
+   who died before the release: archive footage, posthumous release...).
 5. Rows that belong to a title missing from ``title.basics`` are dropped:
    they cannot be linked to anything. Rows referencing a missing person are
    kept and flagged, because the title side is still valid. Unknown people
@@ -23,12 +24,7 @@ found), so ``F.size("dq_flags") == 0`` selects fully clean rows.
 
 from pyspark.sql import functions as F
 
-from imdb_project.quality import (
-    ARCHIVE_CATEGORIES,
-    CURRENT_YEAR,
-    MAX_PLAUSIBLE_AGE,
-    typed,
-)
+from imdb_project.quality import not_archive, row_checks, typed
 
 LIST_COLUMNS = {
     "name.basics": ["primaryProfession", "knownForTitles"],
@@ -39,6 +35,23 @@ LIST_COLUMNS = {
 BOOLEAN_COLUMNS = {
     "title.akas": ["isOriginalTitle"],
     "title.basics": ["isAdult"],
+}
+# Columns set to null when an ``impossible_value`` check of ``quality.py`` is
+# true. When two years contradict each other, which one is wrong cannot be
+# known: both are removed.
+IMPOSSIBLE_VALUE_COLUMNS = {
+    "death_before_birth": ["birthYear", "deathYear"],
+    "birth_in_future": ["birthYear"],
+    "death_in_future": ["deathYear"],
+    "end_before_start": ["endYear"],
+    "start_before_cinema": ["startYear"],
+    "non_positive_runtime": ["runtimeMinutes"],
+    "invalid_is_adult": ["isAdult"],
+    "invalid_is_original_title": ["isOriginalTitle"],
+    "episode_is_own_parent": ["parentTconst"],
+    "negative_season_or_episode": ["seasonNumber", "episodeNumber"],
+    "rating_out_of_range": ["averageRating"],
+    "non_positive_votes": ["numVotes"],
 }
 
 
@@ -54,56 +67,52 @@ def flags(*rules):
 
 
 def _base(df, table):
-    """Cast types, split list columns and convert 0/1 columns to booleans."""
+    """Cast types and split list columns.
+
+    Empty items are removed from the lists (``"nm1,"`` gives ``["nm1"]``); a
+    list left empty becomes null, like a missing list in the source.
+    """
     df = typed(df, table)
     for column in LIST_COLUMNS.get(table, []):
-        df = df.withColumn(column, F.split(F.col(column), ","))
-    for column in BOOLEAN_COLUMNS.get(table, []):
-        df = df.withColumn(column, F.col(column) == 1)
+        items = F.array_remove(F.split(F.col(column), ","), "")
+        df = df.withColumn(column, F.when(F.size(items) > 0, items))
     return df
 
 
-def clean_names(bronze):
-    df = _base(bronze, "name.basics")
-    death_before_birth = F.col("deathYear") < F.col("birthYear")
-    df = df.withColumn(
-        "dq_flags",
-        flags(
-            ("death_before_birth", death_before_birth),
-            ("lifespan_over_max",
-             (F.col("deathYear") - F.col("birthYear")) > MAX_PLAUSIBLE_AGE),
-            ("probably_missing_death_year",
-             F.col("deathYear").isNull()
-             & (F.col("birthYear") < CURRENT_YEAR - MAX_PLAUSIBLE_AGE)),
-        ),
-    )
-    # Which of the two years is wrong cannot be known: both are removed.
-    for column in ("birthYear", "deathYear"):
+def _flag_and_clean(df, table, *extra_rules):
+    """Add ``dq_flags`` and apply the impossible-value rules of ``table``.
+
+    The flags are computed first, on the original values: setting a column to
+    null cannot hide another check. Then every column listed in
+    ``IMPOSSIBLE_VALUE_COLUMNS`` for a raised flag is set to null, and the 0/1
+    columns become booleans.
+    """
+    rules = [(check, cond) for _, check, cond in row_checks(table)]
+    df = df.withColumn("dq_flags", flags(*rules, *extra_rules))
+    impossible = [
+        check for category, check, _ in row_checks(table)
+        if category == "impossible_value"
+    ]
+    for check in impossible:
+        for column in IMPOSSIBLE_VALUE_COLUMNS[check]:
+            df = df.withColumn(
+                column,
+                F.when(F.array_contains("dq_flags", check), None).otherwise(F.col(column)),
+            )
+    for column in BOOLEAN_COLUMNS.get(table, []):
         df = df.withColumn(
-            column, F.when(death_before_birth, None).otherwise(F.col(column))
+            column,
+            F.when(F.col(column) == 1, True).when(F.col(column) == 0, False),
         )
     return df
 
 
+def clean_names(bronze):
+    return _flag_and_clean(_base(bronze, "name.basics"), "name.basics")
+
+
 def clean_titles(bronze):
-    df = _base(bronze, "title.basics")
-    df = df.withColumn(
-        "dq_flags",
-        flags(
-            ("non_positive_runtime", F.col("runtimeMinutes") <= 0),
-            ("runtime_over_24h", F.col("runtimeMinutes") > 1440),
-            ("start_in_future", F.col("startYear") > CURRENT_YEAR),
-            ("end_before_start", F.col("endYear") < F.col("startYear")),
-        ),
-    )
-    df = df.withColumn(
-        "runtimeMinutes",
-        F.when(F.col("runtimeMinutes") <= 0, None).otherwise(F.col("runtimeMinutes")),
-    )
-    return df.withColumn(
-        "endYear",
-        F.when(F.col("endYear") < F.col("startYear"), None).otherwise(F.col("endYear")),
-    )
+    return _flag_and_clean(_base(bronze, "title.basics"), "title.basics")
 
 
 def _keep_known_titles(df, titles, column="tconst"):
@@ -114,7 +123,7 @@ def _keep_known_titles(df, titles, column="tconst"):
 def clean_akas(bronze, titles):
     df = _base(bronze, "title.akas")
     df = _keep_known_titles(df, titles, "titleId")
-    return df.withColumn("dq_flags", flags())
+    return _flag_and_clean(df, "title.akas")
 
 
 def _drop_unknown_people(df, column, names):
@@ -123,16 +132,28 @@ def _drop_unknown_people(df, column, names):
     The order of the remaining ids is kept. Adds a boolean ``__removed_<column>``
     column, true when at least one id was removed. A list whose ids are all
     unknown becomes null, like a list that was empty in the source.
+
+    The kept ids are grouped by ``(tconst, original list)``, not by ``tconst``
+    alone: if ``title.crew`` has two rows for the same title, their lists are
+    not merged. Identical rows give identical lists (``collect_set``).
     """
     known = names.select(F.col("nconst").alias("__person"))
     kept = (
-        df.select("tconst", F.posexplode(column).alias("__pos", "__person"))
+        df.select(
+            "tconst",
+            F.col(column).alias("__list"),
+            F.posexplode(column).alias("__pos", "__person"),
+        )
         .join(known, "__person", "left_semi")
-        .groupBy("tconst")
-        .agg(F.sort_array(F.collect_list(F.struct("__pos", "__person"))).alias("__kept"))
-        .select("tconst", F.col("__kept.__person").alias("__kept"))
+        .groupBy("tconst", "__list")
+        .agg(F.sort_array(F.collect_set(F.struct("__pos", "__person"))).alias("__kept"))
+        .select(
+            "tconst",
+            F.col("__list").alias(column),
+            F.col("__kept.__person").alias("__kept"),
+        )
     )
-    df = df.join(kept, "tconst", "left")
+    df = df.join(kept, ["tconst", column], "left")
     removed = F.coalesce(F.size(column), F.lit(0)) > F.coalesce(F.size("__kept"), F.lit(0))
     return (
         df.withColumn(f"__removed_{column}", F.coalesce(removed, F.lit(False)))
@@ -161,7 +182,7 @@ def clean_crew(bronze, titles, names):
 def clean_ratings(bronze, titles):
     df = _base(bronze, "title.ratings")
     df = _keep_known_titles(df, titles)
-    return df.withColumn("dq_flags", flags())
+    return _flag_and_clean(df, "title.ratings")
 
 
 def clean_episodes(bronze, titles):
@@ -177,10 +198,10 @@ def clean_episodes(bronze, titles):
         "parentTconst",
         "left",
     )
-    df = df.withColumn(
-        "dq_flags",
-        flags(("episode_before_series",
-               F.col("startYear") < F.col("parentStartYear"))),
+    df = _flag_and_clean(
+        df,
+        "title.episode",
+        ("episode_before_series", F.col("startYear") < F.col("parentStartYear")),
     )
     return df.select("tconst", "parentTconst", "seasonNumber", "episodeNumber", "dq_flags")
 
@@ -202,8 +223,7 @@ def clean_principals(bronze, titles, names):
             ("orphan_nconst", F.col("__known_person").isNull()),
             ("principal_born_after_title", F.col("birthYear") > F.col("startYear")),
             ("principal_died_before_title",
-             (F.col("deathYear") < F.col("startYear"))
-             & ~F.col("category").isin(*ARCHIVE_CATEGORIES)),
+             (F.col("deathYear") < F.col("startYear")) & not_archive(F.col("category"))),
         ),
     )
     return df.select(

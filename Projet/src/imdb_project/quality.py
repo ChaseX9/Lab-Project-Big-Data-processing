@@ -142,11 +142,14 @@ def invalid_casts(bronze_df, table):
 
 
 def _split(column):
-    """Comma-separated IMDb list column -> array (null stays null)."""
-    return F.split(F.col(column), ",")
+    """Comma-separated IMDb list column -> array (null stays null).
+
+    Empty items (``"nm1,"``) are removed so they are not counted as orphans.
+    """
+    return F.array_remove(F.split(F.col(column), ","), "")
 
 
-def _row_checks(tables):
+def _row_checks():
     """Checks evaluated row by row on a single (typed) table.
 
     Returns ``{table: [(category, check, description, condition)]}``.
@@ -222,6 +225,20 @@ def _row_checks(tables):
     }
 
 
+def row_checks(table):
+    """``[(category, check, condition)]`` of the row checks of ``table``.
+
+    Used by the cleaning (``preparation``) so that every value counted here is
+    also flagged in the silver tables.
+    """
+    return [(category, check, cond) for category, check, _, cond in _row_checks()[table]]
+
+
+def not_archive(category):
+    """True when ``category`` is not an archive category (null counts as not archive)."""
+    return ~F.coalesce(category.isin(*ARCHIVE_CATEGORIES), F.lit(False))
+
+
 def _count_conditions(df, conditions):
     counts = df.agg(
         F.count(F.lit(1)).alias("__rows"),
@@ -265,7 +282,7 @@ def issue_report(spark, tables):
         )
 
     # 1. Row-level checks, one pass per table.
-    for table, checks in _row_checks(tables).items():
+    for table, checks in _row_checks().items():
         total, counts = _count_conditions(tables[table], [c[3] for c in checks])
         for (category, check, description, _), affected in zip(checks, counts):
             add(table, category, check, description, affected, total)
@@ -284,8 +301,7 @@ def issue_report(spark, tables):
         [
             F.col("birthYear") > F.col("startYear"),
             F.col("deathYear") < F.col("startYear"),
-            (F.col("deathYear") < F.col("startYear"))
-            & ~F.col("category").isin(*ARCHIVE_CATEGORIES),
+            (F.col("deathYear") < F.col("startYear")) & not_archive(F.col("category")),
         ],
     )
     add("title.principals", "cross_table", "principal_born_after_title",
