@@ -1,9 +1,12 @@
-# Data (IMDb dumps, Parquet tables, reports) is never committed.
+# Data (IMDb dumps, Parquet tables, reports, streaming outputs) is never committed.
 data/
 *.parquet
 *.tsv
 *.tsv.gz
 *.csv
+
+# Spark streaming checkpoints
+checkpoints/
 
 # Local configuration
 .env

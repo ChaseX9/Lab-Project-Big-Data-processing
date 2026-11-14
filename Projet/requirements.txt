@@ -1,0 +1,4 @@
+# Packages of the Wikipedia -> Kafka producer (installed by the `producer`
+# service of compose.yaml; the Spark container already ships PySpark).
+confluent-kafka==2.6.1
+requests==2.32.3
