@@ -1,7 +1,7 @@
 """Definitions shared by several parts of the project.
 
 What a feature film, a reliable rating and an actor are is used by the
-exploration and the enrichment: it is defined once here.
+exploration, the enrichment and the open question: it is defined once here.
 """
 
 from pyspark.sql import functions as F
