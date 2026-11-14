@@ -20,12 +20,15 @@ articles and writes (under ``data/streaming/``):
 - ``progress.jsonl``: Spark streaming metrics of every micro-batch.
 
 Checkpoints are in ``checkpoints/streaming/`` so a stopped query restarts
-where it left off.
+where it left off. A query that restarts from its checkpoint ignores
+``--starting-offsets``; ``run --fresh`` deletes the checkpoints and the
+outputs first, for a new test from scratch.
 """
 
 import argparse
 import json
 import os
+import shutil
 import time
 
 from pyspark.sql import functions as F
@@ -36,6 +39,8 @@ from imdb_project.spark import get_spark, kafka_bootstrap_servers
 
 TOPIC = os.environ.get("KAFKA_TOPIC", "wikipedia-changes")
 CHECKPOINTS = PROJECT_DIR / "checkpoints" / "streaming"
+# Everything written by `run` (the lookup is kept).
+RUN_OUTPUTS = ["matches", "windows", "windows_final", "progress.jsonl"]
 
 
 def lookup(spark):
@@ -68,7 +73,54 @@ def lookup(spark):
     table.groupBy("entity_type").count().show()
 
 
-def run(spark, minutes, starting_offsets):
+def clear_previous_run():
+    """Delete the checkpoints and the outputs of the previous run.
+
+    Both must go together: a Parquet sink keeps the list of the batches it
+    has written in ``_spark_metadata``, so with new checkpoints (batch ids
+    starting again from 0) it would skip these batches without any error.
+    """
+    shutil.rmtree(CHECKPOINTS, ignore_errors=True)
+    for name in RUN_OUTPUTS:
+        path = STREAMING_DIR / name
+        if path.is_dir():
+            shutil.rmtree(path)
+        elif path.exists():
+            path.unlink()
+    print("Previous checkpoints and outputs deleted")
+
+
+def check_previous_run(starting_offsets):
+    """Warn when the query resumes, refuse when the outputs would be wrong."""
+    if CHECKPOINTS.exists():
+        print(f"WARNING: checkpoints found in {CHECKPOINTS}: the query resumes "
+              f"from them and --starting-offsets {starting_offsets} is ignored. "
+              "Use --fresh to start a new test from scratch.")
+        return
+    leftovers = [name for name in ("matches", "windows")
+                 if (STREAMING_DIR / name / "_spark_metadata").exists()]
+    if leftovers:
+        raise SystemExit(
+            f"Outputs of a previous run found ({', '.join(leftovers)}) but no "
+            "checkpoint: the new batches would be skipped by the Parquet sinks. "
+            "Run again with --fresh.")
+
+
+def has_parquet(path):
+    """True if a Parquet output has at least one data file.
+
+    A streaming sink that has not written anything yet only contains
+    ``_spark_metadata``, and ``spark.read.parquet`` cannot infer its schema.
+    """
+    return path.is_dir() and any(path.glob("*.parquet"))
+
+
+def run(spark, minutes, starting_offsets, fresh):
+    if fresh:
+        clear_previous_run()
+    else:
+        check_previous_run(starting_offsets)
+
     lookup_table = spark.read.parquet(str(STREAMING_DIR / "lookup")).cache()
     kafka = (
         spark.readStream.format("kafka")
@@ -109,13 +161,15 @@ def run(spark, minutes, starting_offsets):
         .queryName("console")
         .start()
     )
+    queries = [matches, windows, console]
 
     progress_file = STREAMING_DIR / "progress.jsonl"
     progress_file.parent.mkdir(parents=True, exist_ok=True)
     seen = set()
     stop = time.time() + minutes * 60
+    stopped = []
     with open(progress_file, "a", encoding="utf-8") as out:
-        while time.time() < stop and matches.isActive:
+        while time.time() < stop and not stopped:
             time.sleep(10)
             for query in (matches, windows):
                 for p in query.recentProgress:
@@ -127,19 +181,34 @@ def run(spark, minutes, starting_offsets):
                         seen.add(key)
                         out.write(json.dumps(data) + "\n")
             out.flush()
-    for query in (console, matches, windows):
+            stopped = [query for query in queries if not query.isActive]
+    for query in queries:
         query.stop()
+    if stopped:
+        # A query stops by itself only when it fails.
+        for query in stopped:
+            error = str(query.exception()).splitlines()[0]
+            print(f"Query '{query.name}' stopped: {error}")
+        raise SystemExit("Streaming query failed; outputs are incomplete")
     print(f"Stopped after {minutes} minutes; metrics in {progress_file}")
 
     # Last windows: the stream only writes a window once the watermark has
     # passed its end, which never happens for the final ones.
-    saved = spark.read.parquet(str(STREAMING_DIR / "matches"))
+    if has_parquet(STREAMING_DIR / "matches"):
+        saved = spark.read.parquet(str(STREAMING_DIR / "matches"))
+    else:
+        print("No relevant change saved during this run")
+        saved = spark.createDataFrame([], relevant.schema)
     st.final_window_counts(saved).write.mode("overwrite").parquet(
         str(STREAMING_DIR / "windows_final"))
     print(f"Final window counts written to {STREAMING_DIR / 'windows_final'}")
 
 
 def report(spark):
+    if not has_parquet(STREAMING_DIR / "matches"):
+        print("No relevant change saved yet: run `jobs/streaming.py run` "
+              "(with the producer) first.")
+        return
     matches = spark.read.parquet(str(STREAMING_DIR / "matches"))
     print("\n=== Relevant changes per entity type ===")
     matches.groupBy("entity_type").agg(
@@ -153,8 +222,12 @@ def report(spark):
     matches.groupBy("imdb_id", "imdb_name", "entity_type").count().orderBy(
         F.desc("count")).show(15, truncate=False)
 
-    streamed = spark.read.parquet(str(STREAMING_DIR / "windows"))
     final = spark.read.parquet(str(STREAMING_DIR / "windows_final"))
+    if has_parquet(STREAMING_DIR / "windows"):
+        streamed = spark.read.parquet(str(STREAMING_DIR / "windows"))
+    else:
+        # Short run: no window was finalised by the watermark.
+        streamed = spark.createDataFrame([], final.schema)
     keys = ["window_start", "window_end", "entity_type"]
     print("=== Windows: finalised by the stream (watermark) vs batch count at the end ===")
     final.select(*keys, F.col("changes").alias("changes_batch")).join(
@@ -178,14 +251,17 @@ def main():
     parser.add_argument("step", choices=["lookup", "run", "report"])
     parser.add_argument("--minutes", type=float, default=25)
     parser.add_argument("--starting-offsets", default="earliest",
-                        choices=["earliest", "latest"])
+                        choices=["earliest", "latest"],
+                        help="only used when the query has no checkpoint")
+    parser.add_argument("--fresh", action="store_true",
+                        help="delete the checkpoints and outputs of the previous run")
     args = parser.parse_args()
     spark = get_spark("imdb-streaming", with_kafka=args.step == "run")
     spark.sparkContext.setLogLevel("WARN")
     if args.step == "lookup":
         lookup(spark)
     elif args.step == "run":
-        run(spark, args.minutes, args.starting_offsets)
+        run(spark, args.minutes, args.starting_offsets, args.fresh)
     else:
         report(spark)
     spark.stop()

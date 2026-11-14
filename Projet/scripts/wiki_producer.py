@@ -13,6 +13,7 @@ Usage (normally through Docker Compose: ``docker compose run --rm producer``):
 import argparse
 import json
 import os
+import sys
 import time
 from datetime import datetime, timedelta
 
@@ -25,6 +26,7 @@ USER_AGENT = (
     "ECE-BigData-IMDb-Project/1.0 "
     "(student project; https://github.com/ChaseX9/Lab-Project-Big-Data-processing)"
 )
+MAX_RETRY_DELAY = 60  # seconds
 
 
 def create_topic(bootstrap, topic, partitions=1):
@@ -39,9 +41,16 @@ def create_topic(bootstrap, topic, partitions=1):
             print(f"topic creation: {error}")
 
 
-def events(last_event_id=None):
-    """Yield ``(event_id, event)`` from the stream, reconnecting on errors."""
-    while True:
+def events(deadline, last_event_id=None):
+    """Yield ``(event_id, event)`` from the stream until ``deadline``.
+
+    ``deadline`` is a ``time.monotonic()`` value. On errors (network, HTTP
+    403/429/5xx) it reconnects, waiting 5 s, then twice as long each time up
+    to 60 s; the deadline is also checked there, so the producer stops on
+    time even when the stream never answers.
+    """
+    delay = 5
+    while time.monotonic() < deadline:
         headers = {"User-Agent": USER_AGENT, "Accept": "text/event-stream"}
         if last_event_id:
             headers["Last-Event-ID"] = last_event_id
@@ -49,8 +58,11 @@ def events(last_event_id=None):
             with requests.get(STREAM_URL, headers=headers, stream=True,
                               timeout=(10, 60)) as response:
                 response.raise_for_status()
+                delay = 5
                 event_id, data = None, []
                 for raw in response.iter_lines(decode_unicode=True):
+                    if time.monotonic() >= deadline:
+                        return
                     if raw is None:
                         continue
                     if raw.startswith("id:"):
@@ -65,8 +77,10 @@ def events(last_event_id=None):
                         last_event_id = event_id or last_event_id
                         event_id, data = None, []
         except requests.RequestException as error:
-            print(f"stream error: {error}, reconnecting in 5 s")
-            time.sleep(5)
+            wait = min(delay, max(0, deadline - time.monotonic()))
+            print(f"stream error: {error}, reconnecting in {wait:.0f} s")
+            time.sleep(wait)
+            delay = min(delay * 2, MAX_RETRY_DELAY)
 
 
 def main():
@@ -81,22 +95,35 @@ def main():
     create_topic(args.bootstrap, args.topic)
     producer = Producer({"bootstrap.servers": args.bootstrap, "compression.type": "lz4",
                          "linger.ms": 100})
-    stop = datetime.now() + timedelta(minutes=args.minutes)
+    failed = []
+
+    def on_delivery(error, message):
+        # Called by poll() / flush() once Kafka has accepted or refused it.
+        if error is not None:
+            failed.append(error)
+
+    deadline = time.monotonic() + args.minutes * 60
+    end = datetime.now() + timedelta(minutes=args.minutes)
     sent = 0
-    print(f"Producing {args.wiki} changes to '{args.topic}' until {stop:%H:%M:%S}")
-    for _, event in events():
-        if datetime.now() >= stop:
-            break
+    print(f"Producing {args.wiki} changes to '{args.topic}' until {end:%H:%M:%S}")
+    for _, event in events(deadline):
         if event.get("wiki") != args.wiki:
             continue
         producer.produce(args.topic, key=event.get("title", "").encode("utf-8"),
-                         value=json.dumps(event).encode("utf-8"))
+                         value=json.dumps(event).encode("utf-8"),
+                         on_delivery=on_delivery)
         producer.poll(0)
         sent += 1
         if sent % 1000 == 0:
             print(f"{datetime.now():%H:%M:%S} {sent:,} events sent")
-    producer.flush(30)
-    print(f"Done: {sent:,} events sent")
+    not_flushed = producer.flush(30)
+    delivered = sent - len(failed) - not_flushed
+    print(f"Done: {sent:,} events sent, {delivered:,} delivered to Kafka")
+    if failed or not_flushed:
+        print(f"WARNING: {len(failed):,} delivery errors"
+              + (f" (first: {failed[0]})" if failed else "")
+              + f", {not_flushed:,} still waiting after the 30 s flush")
+        sys.exit(1)
 
 
 if __name__ == "__main__":
