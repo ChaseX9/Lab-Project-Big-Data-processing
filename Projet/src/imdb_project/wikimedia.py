@@ -1,6 +1,7 @@
 """Polite HTTP access to the Wikimedia APIs (Wikipedia, Wikidata).
 
-Used by ``scripts/fetch_wikipedia.py`` (enrichment).
+Shared by ``scripts/fetch_wikipedia.py`` (enrichment) and
+``scripts/fetch_languages.py`` (exploration Q6).
 
 Politeness: one request at a time, a fixed pause between two requests, a
 descriptive User-Agent (Wikimedia User-Agent policy), and retries with a

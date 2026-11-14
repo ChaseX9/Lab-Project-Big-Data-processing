@@ -1,7 +1,7 @@
 """Definitions shared by several parts of the project.
 
-What a feature film and a reliable rating are is defined once here, so that
-every part uses the same definition.
+What a feature film, a reliable rating and an actor are is used by the
+exploration and the enrichment: it is defined once here.
 """
 
 from pyspark.sql import functions as F
@@ -10,6 +10,8 @@ from pyspark.sql import functions as F
 FEATURE_MIN_RUNTIME = 40
 # Ratings based on fewer votes are considered unreliable.
 MIN_VOTES = 1000
+# Acting credits in title.principals.
+ACTING_CATEGORIES = ["actor", "actress"]
 
 
 def feature_films(titles, min_runtime=FEATURE_MIN_RUNTIME):
