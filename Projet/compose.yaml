@@ -51,6 +51,24 @@ services:
     depends_on:
       - kafka
 
+  # Wikipedia -> Kafka producer, only started on demand:
+  #   docker compose run --rm producer --minutes 30
+  producer:
+    image: python:3.12-slim
+    container_name: projet_producer
+    profiles: ["streaming"]
+    working_dir: /app
+    volumes:
+      - .:/app
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: kafka:19092
+      PYTHONUNBUFFERED: "1"
+    entrypoint: ["sh", "-c", "pip install --quiet --disable-pip-version-check -r requirements.txt && python scripts/wiki_producer.py \"$$@\"", "--"]
+    networks:
+      - projet-net
+    depends_on:
+      - kafka
+
 networks:
   projet-net:
     driver: bridge

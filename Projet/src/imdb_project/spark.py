@@ -2,14 +2,21 @@
 
 import os
 
+import pyspark
 from pyspark.sql import SparkSession
 
 
-def get_spark(app_name="imdb-project"):
+def kafka_package():
+    """Maven coordinates of the Kafka connector matching the installed Spark."""
+    return f"org.apache.spark:spark-sql-kafka-0-10_2.13:{pyspark.__version__}"
+
+
+def get_spark(app_name="imdb-project", with_kafka=False):
     """Return a local Spark session configured from environment variables.
 
     ``SPARK_DRIVER_MEMORY`` and ``SPARK_SHUFFLE_PARTITIONS`` are set in
-    ``compose.yaml`` (and can be overridden in ``.env``).
+    ``compose.yaml`` (and can be overridden in ``.env``). Pass
+    ``with_kafka=True`` to load the Kafka connector for Structured Streaming.
     """
     builder = (
         SparkSession.builder.appName(app_name)
@@ -21,6 +28,8 @@ def get_spark(app_name="imdb-project"):
         )
         .config("spark.sql.session.timeZone", "UTC")
     )
+    if with_kafka:
+        builder = builder.config("spark.jars.packages", kafka_package())
     return builder.getOrCreate()
 
 

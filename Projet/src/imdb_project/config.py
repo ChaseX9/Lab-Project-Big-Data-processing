@@ -20,6 +20,7 @@ BRONZE_DIR = DATA_DIR / "bronze"
 SILVER_DIR = DATA_DIR / "silver"
 REPORTS_DIR = DATA_DIR / "reports"
 ENRICHMENT_DIR = DATA_DIR / "enrichment"
+STREAMING_DIR = DATA_DIR / "streaming"
 
 IMDB_BASE_URL = "https://datasets.imdbws.com"
 
