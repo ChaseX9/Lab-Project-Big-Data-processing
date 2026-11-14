@@ -11,6 +11,7 @@ growing pause on network errors and on HTTP 429 / 5xx, honouring
 import json
 import time
 from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 
 import requests
 
@@ -22,6 +23,25 @@ WIKIDATA_SPARQL = "https://query.wikidata.org/sparql"
 WIKIPEDIA_API = "https://en.wikipedia.org/w/api.php"
 WIKIPEDIA_PAGE = "https://en.wikipedia.org/wiki/"
 WIKIDATA_PAGE = "https://www.wikidata.org/wiki/"
+
+
+def retry_after(response, default):
+    """Seconds to wait from a ``Retry-After`` header, else ``default``.
+
+    The header is either a number of seconds or an HTTP date (RFC 9110).
+    """
+    value = response.headers.get("Retry-After")
+    if value is None:
+        return default
+    try:
+        return max(0, int(value))
+    except ValueError:
+        pass
+    try:
+        delta = parsedate_to_datetime(value) - datetime.now(timezone.utc)
+        return max(0, int(delta.total_seconds()))
+    except (TypeError, ValueError):
+        return default
 
 
 class Client:
@@ -49,14 +69,14 @@ class Client:
                 time.sleep(backoff)
                 continue
             if response.status_code in (429, 500, 502, 503, 504):
-                retry_after = int(response.headers.get("Retry-After", 5 * 2 ** attempt))
-                print(f"  server busy ({response.status_code}), waiting {retry_after}s")
-                time.sleep(retry_after)
+                wait = retry_after(response, 5 * 2 ** attempt)
+                print(f"  server busy ({response.status_code}), waiting {wait}s")
+                time.sleep(wait)
                 continue
             response.raise_for_status()
             data = response.json()
             if isinstance(data, dict) and data.get("error", {}).get("code") == "maxlag":
-                time.sleep(int(response.headers.get("Retry-After", 5)))
+                time.sleep(retry_after(response, 5))
                 continue
             return data
         raise RuntimeError(f"giving up on {url} after {self.max_retries} attempts")
@@ -72,7 +92,28 @@ def now():
 
 
 def already_fetched(path):
+    """Ids already saved in the JSON lines file ``path``.
+
+    Lines that cannot be read are skipped (for instance the last line, cut
+    when the script was stopped while writing): their ids are fetched again.
+    """
     if not path.exists():
         return set()
+    done = set()
     with open(path, encoding="utf-8") as f:
-        return {json.loads(line)["imdb_id"] for line in f if line.strip()}
+        for line in f:
+            try:
+                done.add(json.loads(line)["imdb_id"])
+            except (json.JSONDecodeError, KeyError, TypeError):
+                continue
+    return done
+
+
+def end_with_newline(path):
+    """Add a line break if ``path`` ends with a cut line, so the next record
+    appended to the file starts on its own line."""
+    if path.exists() and path.stat().st_size > 0:
+        with open(path, "rb+") as f:
+            f.seek(-1, 2)
+            if f.read(1) != b"\n":
+                f.write(b"\n")

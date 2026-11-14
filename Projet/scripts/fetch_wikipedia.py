@@ -40,6 +40,7 @@ from imdb_project.wikimedia import (  # noqa: E402
     Client,
     already_fetched,
     chunks,
+    end_with_newline,
     now,
 )
 
@@ -75,7 +76,12 @@ def wikidata_articles(client, imdb_ids):
 
 
 def page_extracts(client, titles, intro_only):
-    """Plain-text extracts of Wikipedia pages, keyed by requested title."""
+    """Plain-text extracts of Wikipedia pages, keyed by requested title.
+
+    The value is ``(final title, text)``, or ``None`` when Wikipedia says the
+    page does not exist. Titles absent from the result got no answer (API
+    error, incomplete response): they must be fetched again later.
+    """
     params = {
         "action": "query",
         "prop": "extracts",
@@ -91,6 +97,10 @@ def page_extracts(client, titles, intro_only):
         params["exintro"] = 1
         params["exlimit"] = "max"
     data = client.get(WIKIPEDIA_API, params)
+    if "error" in data:
+        # e.g. "ratelimited" or "readonly": temporary, nothing is saved.
+        print(f"  API error ({data['error'].get('code')}), retried on the next run")
+        return {}
     query = data.get("query", {})
     # Follow normalisation and redirects back to the requested title.
     alias = {t: t for t in titles}
@@ -102,7 +112,11 @@ def page_extracts(client, titles, intro_only):
     out = {}
     for requested, final in alias.items():
         page = pages.get(final)
-        if page and not page.get("missing"):
+        if page is None:
+            continue
+        if page.get("missing") or page.get("invalid"):
+            out[requested] = None
+        else:
             out[requested] = (page["title"], page.get("extract", ""))
     return out
 
@@ -135,6 +149,7 @@ def fetch(client, kind, limit):
 
     intro_only = kind == "people"
     page_batch = EXTRACT_BATCH if intro_only else 1
+    end_with_newline(output)
     with open(output, "a", encoding="utf-8") as out:
         for batch_number, batch in enumerate(chunks(todo, SPARQL_BATCH), start=1):
             mapping = wikidata_articles(client, batch)
@@ -149,11 +164,13 @@ def fetch(client, kind, limit):
                 extracts = page_extracts(client, list(set(titles.values())), intro_only)
                 for i in group:
                     qid, title = mapping[i]
-                    if title in extracts:
+                    if title not in extracts:
+                        continue          # no answer: not saved, fetched again later
+                    if extracts[title] is None:
+                        rec = record(i, kind, "missing_page", qid, title)
+                    else:
                         final_title, text = extracts[title]
                         rec = record(i, kind, "ok", qid, final_title, text)
-                    else:
-                        rec = record(i, kind, "missing_page", qid, title)
                     out.write(json.dumps(rec, ensure_ascii=False) + "\n")
                 out.flush()
             print(f"[{kind}] batch {batch_number}: {len(batch)} ids, "

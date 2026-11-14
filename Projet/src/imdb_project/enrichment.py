@@ -14,6 +14,8 @@ Nothing depends on the size of the target list: the same code runs on the
 full IMDb dataset by changing the parameters of ``select_targets``.
 """
 
+from pathlib import Path
+
 from pyspark.sql import Window
 from pyspark.sql import functions as F
 from pyspark.sql.types import StringType, StructField, StructType
@@ -104,7 +106,13 @@ def select_targets(titles, ratings, principals, people, first_year=1980,
 
 
 def read_raw(spark, path):
-    """Read the raw JSON lines with the enforced schema (bad lines dropped)."""
+    """Read the raw JSON lines with the enforced schema (bad lines dropped).
+
+    A file that does not exist yet (that kind was not fetched) gives an empty
+    DataFrame: every target then gets the "not fetched" note.
+    """
+    if not Path(path).exists():
+        return spark.createDataFrame([], RAW_SCHEMA)
     return (
         spark.read.schema(RAW_SCHEMA)
         .option("mode", "DROPMALFORMED")
