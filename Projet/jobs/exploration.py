@@ -12,11 +12,26 @@ Usage (inside the Spark container, from the ``projet`` folder):
 import argparse
 
 from pyspark.sql import functions as F
+from pyspark.sql.types import ArrayType, StringType, StructField, StructType
 
 from imdb_project import exploration as ex
 from imdb_project.config import ENRICHMENT_DIR, RESULTS_DIR
 from imdb_project.io import read_silver
 from imdb_project.spark import get_spark
+
+
+# Records written by scripts/fetch_languages.py.
+LANGUAGES_SCHEMA = StructType([
+    StructField("imdb_id", StringType()),
+    StructField("wikidata_id", StringType()),
+    StructField("languages", ArrayType(StructType([
+        StructField("id", StringType()),
+        StructField("label", StringType()),
+    ]))),
+    StructField("status", StringType()),
+    StructField("source_url", StringType()),
+    StructField("retrieved_at", StringType()),
+])
 
 
 def save(df, name):
@@ -112,7 +127,12 @@ def q6(spark, t):
     if not raw.exists():
         print(f"Run `python scripts/fetch_languages.py` first ({targets} written).")
         return
-    fetched = spark.read.json(str(raw)).dropDuplicates(["imdb_id"])
+    # A line cut by an interrupted run is dropped (its film is fetched again).
+    fetched = (
+        spark.read.schema(LANGUAGES_SCHEMA).option("mode", "DROPMALFORMED").json(str(raw))
+        .where(F.col("imdb_id").isNotNull())
+        .dropDuplicates(["imdb_id"])
+    )
     fetched = fetched.join(successful.select(F.col("tconst").alias("imdb_id")), "imdb_id")
     print("Wikidata coverage of the successful films:")
     fetched.groupBy("status").count().show()

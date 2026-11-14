@@ -39,6 +39,7 @@ from imdb_project.wikimedia import (  # noqa: E402
     Client,
     already_fetched,
     chunks,
+    end_with_newline,
     now,
 )
 from imdb_project.config import ENRICHMENT_DIR  # noqa: E402
@@ -109,6 +110,7 @@ def main():
           f"{len(todo):,} to fetch")
 
     labels = {}
+    end_with_newline(output)
     with open(output, "a", encoding="utf-8") as out:
         for batch_number, batch in enumerate(chunks(todo, SPARQL_BATCH), start=1):
             items = wikidata_items(client, batch)

@@ -86,8 +86,10 @@ def runtime_outliers_by_genre(titles, k=3.0, min_genre_size=30, log_scale=False,
         .when(F.col("x") < F.col("q1_x"), (F.col("q1_x") - F.col("x")) / F.col("iqr_x"))
         .otherwise(F.lit(0.0))
     )
+    # A genre whose IQR is 0 (half of its films have the same runtime) has no
+    # spread to compare with: it gets no outlier, and no division by zero.
     outliers = (
-        films.join(F.broadcast(stats), "genre")
+        films.join(F.broadcast(stats.where(F.col("iqr_x") > 0)), "genre")
         .where((F.col("x") < F.col("low_x")) | (F.col("x") > F.col("high_x")))
         .withColumn(
             "direction",
@@ -206,7 +208,10 @@ def genre_popularity_by_year(titles, ratings, first_year=1980, last_year=2025,
 
 
 def top_genres_per_year(popularity, method="votes", top=3):
-    """The ``top`` genres per year for one popularity ``method``, one row per year."""
+    """The ``top`` genres per year for one popularity ``method``, one row per year.
+
+    A year with fewer than ``top`` ranked genres gets nulls in the last columns.
+    """
     rank_col, value_col = POPULARITY_METHODS[method]
     return (
         popularity.where(F.col(rank_col) <= top)
@@ -218,8 +223,10 @@ def top_genres_per_year(popularity, method="votes", top=3):
         )
         .select(
             "year",
-            *[F.col("top")[i]["genre"].alias(f"genre_{i + 1}") for i in range(top)],
-            *[F.col("top")[i]["v"].alias(f"{value_col}_{i + 1}") for i in range(top)],
+            *[F.try_element_at("top", F.lit(i + 1))["genre"].alias(f"genre_{i + 1}")
+              for i in range(top)],
+            *[F.try_element_at("top", F.lit(i + 1))["v"].alias(f"{value_col}_{i + 1}")
+              for i in range(top)],
         )
         .orderBy("year")
     )
