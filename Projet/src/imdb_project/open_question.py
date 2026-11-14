@@ -42,7 +42,8 @@ from pyspark.sql import functions as F
 from imdb_project.definitions import ACTING_CATEGORIES, MIN_VOTES, feature_films, rated
 
 KEVIN_BACON = "nm0000102"
-DECADES = [(1980, 1989), (1990, 1999), (2000, 2009), (2010, 2019), (2020, 2029)]
+# Complete years only: the last decade stops in 2025, like the exploration (Q2).
+DECADES = [(1980, 1989), (1990, 1999), (2000, 2009), (2010, 2019), (2020, 2025)]
 SAMPLE_SIZE = 100
 CANDIDATES = 10
 TOP_DEGREE = 10
@@ -54,12 +55,12 @@ SEED = 42
 # --------------------------------------------------------------------------
 
 
-def costar_edges(titles, ratings, principals, first_year=None, last_year=None,
-                 min_votes=MIN_VOTES):
-    """Undirected co-star edges ``(src, dst, tconst, shared_films)``.
+def film_cast(titles, ratings, principals, first_year=None, last_year=None,
+              min_votes=MIN_VOTES):
+    """Actors credited in the films of the graph: ``(tconst, nconst, startYear)``.
 
-    Each pair of actors appears in both directions; ``tconst`` is one of
-    their shared films (the oldest), used to display paths.
+    Feature films with at least ``min_votes`` votes, released between
+    ``first_year`` and ``last_year`` (both included, ``None`` = no limit).
     """
     films = rated(
         feature_films(titles).where(F.col("startYear").isNotNull())
@@ -70,11 +71,20 @@ def costar_edges(titles, ratings, principals, first_year=None, last_year=None,
         films = films.where(F.col("startYear") >= first_year)
     if last_year is not None:
         films = films.where(F.col("startYear") <= last_year)
-    cast = (
+    return (
         principals.where(F.col("category").isin(*ACTING_CATEGORIES))
         .select("tconst", "nconst").distinct()
         .join(films.select("tconst", "startYear"), "tconst")
     )
+
+
+def costar_edges(cast):
+    """Undirected co-star edges ``(src, dst, tconst, shared_films)``.
+
+    ``cast`` comes from ``film_cast``. Each pair of actors appears in both
+    directions; ``tconst`` is one of their shared films (the oldest), used to
+    display paths.
+    """
     a, b = cast.alias("a"), cast.alias("b")
     pairs = (
         a.join(b, "tconst")
@@ -179,10 +189,15 @@ def shortest_path(spark, edges, start, goal, work_dir, max_depth=50):
 # --------------------------------------------------------------------------
 
 
-def analyse_graph(spark, edges, people, work_dir, sample_size=SAMPLE_SIZE,
+def analyse_graph(spark, edges, people, work_dir, actors=None, sample_size=SAMPLE_SIZE,
                   candidates=CANDIDATES, top_degree=TOP_DEGREE, seed=SEED,
                   extra=(KEVIN_BACON,)):
     """Small-world statistics and centre of a co-star graph.
+
+    ``actors`` is the number of actors credited in the films of the graph,
+    including those who have no co-star (they are not in ``edges``); it is
+    the denominator of ``giant_component_pct``. ``None``: only the actors of
+    ``edges`` are counted.
 
     Returns a dict of DataFrames / values:
 
@@ -191,13 +206,18 @@ def analyse_graph(spark, edges, people, work_dir, sample_size=SAMPLE_SIZE,
     - ``closeness``: exact average distance of the candidates (best
       estimates and most connected actors) and of the ``extra`` actors
       present in the giant component; ``estimated`` and ``top_degree`` say
-      why each actor was selected;
+      why each actor was selected. The summary gives two ranks for Kevin
+      Bacon: among the actors measured exactly
+      (``bacon_rank_among_candidates``, out of ``candidates``) and among the
+      whole giant component on the estimated closeness
+      (``bacon_estimated_rank``, out of ``giant_component``);
     - ``centre_distances``: number of actors at each distance from the
       centre and from each ``extra`` actor.
     """
     edges = edges.cache()
     degree = degrees(edges).cache()
-    actors = degree.count()
+    connected_actors = degree.count()
+    actors = connected_actors if actors is None else actors
     edge_count = edges.count() // 2
 
     # 1. Giant component: everything reachable from the most connected actor.
@@ -219,8 +239,11 @@ def analyse_graph(spark, edges, people, work_dir, sample_size=SAMPLE_SIZE,
         F.avg((F.col("distance") <= 6).cast("int")).alias("share_within_6"),
     ).first()
     estimate = (
+        # The distance 0 of a sampled actor to itself is left out of its
+        # average (it would lower it by about 1 %).
         sampled.groupBy("node")
-        .agg(F.avg("distance").alias("estimated_avg_distance"),
+        .agg(F.avg(F.when(F.col("distance") > 0, F.col("distance")))
+             .alias("estimated_avg_distance"),
              F.count(F.lit(1)).alias("sources_reached"))
         .where(F.col("sources_reached") == len(sample))
     )
@@ -242,16 +265,23 @@ def analyse_graph(spark, edges, people, work_dir, sample_size=SAMPLE_SIZE,
         .join(people.select("nconst", "primaryName"), "nconst", "left")
         .withColumn("estimated", F.col("nconst").isin(*best))
         .withColumn("top_degree", F.col("nconst").isin(*hubs))
-        .select("nconst", "primaryName", "degree", F.round("avg_distance", 3)
-                .alias("avg_distance"), "eccentricity", "reached", "estimated",
-                "top_degree")
-        .orderBy("avg_distance")
+        .select("nconst", "primaryName", "degree", "avg_distance", "eccentricity",
+                "reached", "estimated", "top_degree")
     )
-    closeness_rows = closeness.collect()
+    # Ranked on the exact (unrounded) value, ties broken by nconst; rounded
+    # for display only.
+    closeness_rows = closeness.orderBy("avg_distance", "nconst").collect()
+    closeness = closeness.withColumn("avg_distance", F.round("avg_distance", 3)) \
+        .orderBy("avg_distance", "nconst")
     centre = closeness_rows[0]
     bacon = next((r for r in closeness_rows if r["nconst"] == KEVIN_BACON), None)
-    bacon_rank = (1 + sum(1 for r in closeness_rows if r["avg_distance"] < bacon["avg_distance"])
+    bacon_rank = (1 + [r["nconst"] for r in closeness_rows].index(KEVIN_BACON)
                   if bacon else None)
+    bacon_estimate = estimate.where(F.col("node") == KEVIN_BACON).first()
+    bacon_estimated_rank = (
+        1 + estimate.where(F.col("estimated_avg_distance")
+                           < bacon_estimate["estimated_avg_distance"]).count()
+        if bacon_estimate else None)
 
     shown = [centre["nconst"]] + [e for e in extra if e in in_giant]
     centre_distances = (
@@ -262,17 +292,21 @@ def analyse_graph(spark, edges, people, work_dir, sample_size=SAMPLE_SIZE,
     )
 
     summary = spark.createDataFrame([(
-        actors, edge_count, giant_size, round(100 * giant_size / actors, 2),
+        actors, connected_actors, edge_count, giant_size,
+        round(100 * giant_size / actors, 2),
         round(separation["avg_separation"], 3), float(separation["median_separation"]),
         int(separation["max_distance_seen"]), round(100 * separation["share_within_6"], 2),
-        centre["nconst"], centre["primaryName"], float(centre["avg_distance"]),
-        int(centre["degree"]),
-        float(bacon["avg_distance"]) if bacon else None, bacon_rank,
-    )], """actors long, edges long, giant_component long, giant_component_pct double,
+        centre["nconst"], centre["primaryName"], round(centre["avg_distance"], 3),
+        int(centre["degree"]), len(closeness_rows),
+        round(bacon["avg_distance"], 3) if bacon else None, bacon_rank,
+        bacon_estimated_rank,
+    )], """actors long, connected_actors long, edges long, giant_component long,
+           giant_component_pct double,
            avg_separation double, median_separation double, max_distance_seen int,
            pct_pairs_within_6 double, centre_nconst string, centre_name string,
-           centre_avg_distance double, centre_degree int,
-           bacon_avg_distance double, bacon_rank int""")
+           centre_avg_distance double, centre_degree int, candidates int,
+           bacon_avg_distance double, bacon_rank_among_candidates int,
+           bacon_estimated_rank long""")
     edges.unpersist()
     degree.unpersist()
     return {"summary": summary, "closeness": closeness,

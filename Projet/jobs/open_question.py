@@ -41,11 +41,14 @@ def save_and_show(df, name, rows=40):
     df.show(rows, truncate=False)
 
 
-def build_edges(spark, t, first_year, last_year, name):
+def build_graph(spark, t, first_year, last_year, name):
+    """Co-star edges of the graph and number of actors credited in its films."""
+    cast = oq.film_cast(t["title.basics"], t["title.ratings"], t["title.principals"],
+                        first_year, last_year)
+    actors = cast.select("nconst").distinct().count()
     path = WORK_DIR / f"edges_{name}"
-    oq.costar_edges(t["title.basics"], t["title.ratings"], t["title.principals"],
-                    first_year, last_year).write.mode("overwrite").parquet(str(path))
-    return spark.read.parquet(str(path))
+    oq.costar_edges(cast).write.mode("overwrite").parquet(str(path))
+    return spark.read.parquet(str(path)), actors
 
 
 def describe_path(spark, steps, people, titles):
@@ -61,15 +64,15 @@ def describe_path(spark, steps, people, titles):
 
 def run_all(spark, t):
     graphs = [("all years", None, None)] + [
-        (f"{a}-{min(b, 2025)}", a, b) for a, b in oq.DECADES]
+        (f"{a}-{b}", a, b) for a, b in oq.DECADES]
     summaries, closeness, distances = [], [], []
     edges_all = None
     for order, (label, first, last) in enumerate(graphs):
         print(f"\n##### Graph: {label}")
-        edges = build_edges(spark, t, first, last, label.replace(" ", "_"))
+        edges, actors = build_graph(spark, t, first, last, label.replace(" ", "_"))
         if label == "all years":
             edges_all = edges
-        result = oq.analyse_graph(spark, edges, t["name.basics"], WORK_DIR)
+        result = oq.analyse_graph(spark, edges, t["name.basics"], WORK_DIR, actors)
         tag = F.lit(label).alias("graph")
         summaries.append(result["summary"].select(F.lit(order).alias("graph_order"), tag, "*"))
         closeness.append(result["closeness"].select(tag, "*"))
@@ -97,7 +100,7 @@ def run_all(spark, t):
 
 
 def run_path(spark, t, start, goal):
-    edges = build_edges(spark, t, None, None, "all_years")
+    edges, _ = build_graph(spark, t, None, None, "all_years")
     steps = oq.shortest_path(spark, edges, start, goal, WORK_DIR)
     if steps is None:
         print("These two actors are not connected in the co-star graph.")
