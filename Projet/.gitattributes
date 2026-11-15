@@ -1,0 +1,5 @@
+# Same line endings (LF) on Windows, macOS and Linux, so the files run the
+# same way in the Linux containers whatever the host system.
+* text=auto eol=lf
+*.gz binary
+*.parquet binary
