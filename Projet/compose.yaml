@@ -40,11 +40,15 @@ services:
       SPARK_SHUFFLE_PARTITIONS: ${SPARK_SHUFFLE_PARTITIONS:-64}
       # Kafka address as seen from inside the Docker network.
       KAFKA_BOOTSTRAP_SERVERS: kafka:19092
+      # REPORT.md as seen from inside the container (see volumes).
+      REPORT_PATH: /home/jovyan/repo/REPORT.md
     volumes:
       - .:/home/jovyan/projet
       # Separate mount so Docker creates ./data on a fresh clone (data/ is not
       # in Git); without it, CHOWN_EXTRA fails and the container stops.
       - ./data:/home/jovyan/projet/data
+      # Repository root, so that scripts/report_tables.py can update REPORT.md.
+      - ..:/home/jovyan/repo
     working_dir: /home/jovyan/projet
     networks:
       - projet-net
